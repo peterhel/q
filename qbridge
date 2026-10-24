@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""qbridge: your phone ↔ q, over ntfy.
+
+In (topic Q_IN), one message per item:
+  myapp: text                    to the project (the orchestrator, or anyone)
+  myapp/myapp-2: text            to one session
+  bug myapp: text                with a type (idea | bug | feature), or #bug anywhere in the text
+  261023-0948-qos: text          an answer to a question the queue asked (q ask)
+  ?                              which projects and sessions are there
+
+Out (topic Q_OUT): confirmations, questions from `q ask`, `q tell`, and the session list (tag
+`sessions`, priority min, JSON body) that the PWA builds its picker from.
+
+Text from the phone is data. It is stored with `q`, run with an argument list (never a shell),
+and only for projects in ~/.claude/queue/projects.json.
+
+Config: ~/.config/q/ntfy.env (mode 600): NTFY_URL, NTFY_TOKEN, Q_IN, Q_OUT.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path(os.environ.get("Q_HOME", Path.home() / ".claude" / "queue"))
+CONF = Path(os.environ.get("Q_BRIDGE_CONF", Path.home() / ".config" / "q" / "ntfy.env"))
+Q = str(Path(__file__).resolve().parent / "q")
+ITEM_RE = re.compile(r"\d{6}-\d{4}-[a-z2-7]{3}")
+UNDO_RE = re.compile(r"^(?:undo|ångra)\s+(\d{6}-\d{4}-[a-z2-7]{3})$", re.I)
+ID_RE = re.compile(r"^(\d{6}-\d{4}-[a-z2-7]{3})\s*:\s*(.+)$", re.S)
+ADDR_RE = re.compile(r"^(?:(idea|bug|feature)\s+)?([A-Za-z0-9_.\-]+)(?:/([A-Za-z0-9_.\-]+))?\s*:\s*(.+)$",
+                     re.S)
+TAG_RE = re.compile(r"(?:^|\s)#(idea|bug|feature)\b")
+MAX_TEXT = 8000
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+
+def load_conf():
+    conf = {}
+    if CONF.exists():
+        if CONF.stat().st_mode & 0o077:
+            sys.exit(f"qbridge: {CONF} must be mode 600")
+        for line in CONF.read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() and not k.strip().startswith("#"):
+                conf[k.strip()] = v.strip().strip('"\'')
+    conf.update({k: os.environ[k] for k in ("NTFY_URL", "NTFY_TOKEN", "NTFY_REPLY_TOKEN", "Q_IN",
+                                            "Q_OUT")
+                 if k in os.environ})
+    missing = [k for k in ("NTFY_URL", "NTFY_TOKEN", "Q_IN", "Q_OUT") if not conf.get(k)]
+    if missing:
+        sys.exit(f"qbridge: missing {', '.join(missing)} in {CONF}")
+    conf["NTFY_URL"] = conf["NTFY_URL"].rstrip("/")
+    return conf
+
+
+# ── parsing (pure, tested) ────────────────────────────────────────────────────────────────────
+
+def parse_message(text):
+    """→ ("answer", id, text) | ("add", project, session, type, text) | ("undo", id) | ("who",)
+    | ("error", why)"""
+    text = (text or "").strip()
+    if not text:
+        return ("error", "empty message")
+    if len(text) > MAX_TEXT:
+        return ("error", f"longer than {MAX_TEXT} characters")
+    if text in ("?", "who", "vilka"):
+        return ("who",)
+    m = UNDO_RE.match(text)
+    if m:
+        return ("undo", m.group(1))
+    m = ID_RE.match(text)
+    if m:
+        return ("answer", m.group(1), m.group(2).strip())
+    m = ADDR_RE.match(text)
+    if not m:
+        return ("error", "write `project: text` or `project/session: text` (`?` lists them)")
+    kind, project, session, body = m.groups()
+    tag = TAG_RE.search(body)
+    if tag:
+        kind = kind or tag.group(1)
+        body = TAG_RE.sub(" ", body).strip()
+    return ("add", project, session, kind or "idea", body.strip())
+
+
+# ── ntfy ──────────────────────────────────────────────────────────────────────────────────────
+
+class Ntfy:
+    def __init__(self, conf):
+        self.c = conf
+
+    def _req(self, path, data=None, headers=None):
+        # Cloudflare answers Python's default User-Agent with 403 (error 1010).
+        h = {"Authorization": f"Bearer {self.c['NTFY_TOKEN']}", "User-Agent": "qbridge/1",
+             **(headers or {})}
+        return urllib.request.Request(f"{self.c['NTFY_URL']}/{path}", data=data, headers=h)
+
+    def reply(self, label, body):
+        """A button that posts `body` to Q_IN from the notification itself, or None without a
+        reply token. The token may only write to Q_IN, and only Peter's users read Q_OUT."""
+        tok = self.c.get("NTFY_REPLY_TOKEN")
+        if not tok:
+            return None
+        return (f"http, {label}, {self.c['NTFY_URL']}/{self.c['Q_IN']}, method=POST, "
+                f"headers.Authorization=Bearer {tok}, body={body}, clear=true")
+
+    def publish(self, text, title=None, tags=None, priority=None, actions=None):
+        h = {}
+        actions = [a for a in actions or [] if a][:3]           # ntfy shows at most 3
+        if actions:
+            h["Actions"] = "; ".join(actions).encode("utf-8").decode("latin-1", "replace")
+        if title:
+            h["Title"] = title.encode("utf-8").decode("latin-1", "replace")
+        if tags:
+            h["Tags"] = tags
+        if priority:
+            h["Priority"] = str(priority)
+        try:
+            urllib.request.urlopen(self._req(self.c["Q_OUT"], text.encode(), h), timeout=20).read()
+            return True
+        except (urllib.error.URLError, OSError) as e:
+            log("publish failed:", type(e).__name__, getattr(e, "code", ""))
+            return False
+
+    def stream(self, since):
+        """Yield messages on Q_IN forever, from `since` (a message id or a duration)."""
+        url = f"{self.c['Q_IN']}/json?since={since}"
+        with urllib.request.urlopen(self._req(url), timeout=90) as r:   # ntfy keepalives every 45 s
+            for line in r:
+                ev = json.loads(line)
+                if ev.get("event") == "message":
+                    yield ev
+
+
+# ── q ─────────────────────────────────────────────────────────────────────────────────────────
+
+def q(*args):
+    env = {**os.environ, "Q_FROM": "phone"}
+    env.pop("TMUX_PANE", None)
+    r = subprocess.run([sys.executable, Q, *args], capture_output=True, text=True, env=env,
+                       timeout=30)
+    return r.returncode, (r.stdout.strip() or r.stderr.strip().removeprefix("q: "))
+
+
+def who_all():
+    rc, out = q("who", "--all", "--json")
+    return json.loads(out) if rc == 0 else {}
+
+
+def handle(ntfy, text):
+    p = parse_message(text)
+    if p[0] == "error":
+        ntfy.publish(p[1], title="q: not understood", tags="question")
+    elif p[0] == "who":
+        lines = [f"{n}: {', '.join(v['sessions']) or '-'}" + (f" (orch {v['orch']})" if v["orch"]
+                 else "") for n, v in sorted(who_all().items())]
+        ntfy.publish("\n".join(lines) or "no projects", title="q: sessions")
+        publish_sessions(ntfy, force=True)
+    elif p[0] == "answer":
+        project = _project_of(p[1])
+        if not project:
+            ntfy.publish(f"no open item {p[1]}", title="q: not found", tags="question")
+            return
+        rc, out = q("-p", project, "answer", p[1], p[2])
+        ntfy.publish(out, title=f"q: {project}" if rc == 0 else "q: failed",
+                     tags=None if rc == 0 else "warning")
+    elif p[0] == "undo":
+        project = _project_of(p[1], states=("new",))
+        if not project:
+            ntfy.publish(f"{p[1]} is not waiting in new any more", title="q: not undone",
+                         tags="warning")
+            return
+        rc, out = q("-p", project, "done", p[1], "withdrawn by Peter from the phone")
+        ntfy.publish(out, title=f"q: undone ({project})" if rc == 0 else "q: failed",
+                     tags=None if rc == 0 else "warning", priority=2)
+    else:
+        _, project, session, kind, body = p
+        args = ["-p", project] + (["-s", session] if session else []) + [kind, "-"]
+        env = {**os.environ, "Q_FROM": "phone"}
+        env.pop("TMUX_PANE", None)
+        r = subprocess.run([sys.executable, Q, *args], input=body, capture_output=True, text=True,
+                           env=env, timeout=30)
+        out = r.stdout.strip() or r.stderr.strip().removeprefix("q: ")
+        new_id = ITEM_RE.match(out) if r.returncode == 0 else None
+        ntfy.publish(out, title="q: added" if r.returncode == 0 else "q: not added",
+                     tags="white_check_mark" if r.returncode == 0 else "warning",
+                     priority=2 if r.returncode == 0 else None,
+                     actions=[ntfy.reply("Undo", f"undo {new_id.group(0)}")] if new_id else None)
+
+
+def _project_of(item_id, states=("peter", "new", "ready", "taken")):
+    for name, path in _registry().items():
+        for s in states:
+            if (Path(path) / ".queue" / s / f"{item_id}.md").exists():
+                return name
+    return None
+
+
+def _registry():
+    try:
+        return json.loads((HOME / "projects.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+_last_sessions = [None, 0.0]
+
+
+def publish_sessions(ntfy, force=False):
+    state = who_all()
+    body = json.dumps(state, sort_keys=True, ensure_ascii=False)
+    if force or body != _last_sessions[0] or time.time() - _last_sessions[1] > 6 * 3600:
+        if ntfy.publish(body, title="sessions", tags="sessions", priority=1):
+            _last_sessions[:] = [body, time.time()]
+
+
+def drain_outbox(ntfy):
+    out = HOME / "outbox"
+    for f in sorted(out.glob("[0-9]*.json")) if out.is_dir() else []:
+        try:
+            m = json.loads(f.read_text())
+        except (OSError, ValueError):
+            f.rename(f.with_suffix(".bad"))
+            continue
+        ask = m.get("kind") == "ask"
+        title = f"{m['project']}" + (f" asks ({m['item']})" if ask else f" · {m.get('from', '')}")
+        text = m["text"] + (f"\n\nAnswer: {m['item']}: …" if ask else "")
+        actions = [ntfy.reply(o, f"{m['item']}: {o}")
+                   for o in m.get("options") or ["Yes", "No"]] if ask else None
+        if ntfy.publish(text, title=title, tags="question" if ask else "speech_balloon",
+                        priority=4 if ask else 3, actions=actions):
+            f.unlink()
+
+
+def background(ntfy):
+    tick = 0
+    while True:
+        try:
+            drain_outbox(ntfy)
+            if tick % 30 == 0:
+                publish_sessions(ntfy)
+        except Exception as e:                                   # noqa: BLE001
+            log("background:", type(e).__name__, e)
+        tick += 1
+        time.sleep(2)
+
+
+def main():
+    conf = load_conf()
+    ntfy = Ntfy(conf)
+    since_file = HOME / "bridge.since"
+    threading.Thread(target=background, args=(ntfy,), daemon=True).start()
+    delay = 2
+    while True:
+        since = since_file.read_text().strip() if since_file.exists() else "1m"
+        try:
+            for ev in ntfy.stream(since):
+                delay = 2
+                try:
+                    handle(ntfy, ev.get("message", ""))
+                except Exception as e:                           # noqa: BLE001
+                    log("handle:", type(e).__name__, e)
+                since_file.write_text(ev["id"])
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            log("stream:", type(e).__name__, getattr(e, "code", ""), f"retry in {delay}s")
+            time.sleep(delay)
+            delay = min(delay * 2, 300)
+
+
+if __name__ == "__main__":
+    main()

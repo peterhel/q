@@ -1,0 +1,12 @@
+[Unit]
+Description=qbridge: phone <-> q (ntfy)
+After=network-online.target
+ConditionPathExists=%h/.config/q/ntfy.env
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.claude/queue/qbridge
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

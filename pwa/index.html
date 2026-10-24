@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kön</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1f6feb">
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#14171c;--muted:#5b6370;--line:#d9dde3;--acc:#1f6feb;--acc-fg:#fff;--warn:#b42318;--ok:#067647}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1115;--card:#181b21;--fg:#e8eaee;--muted:#9aa3b0;--line:#2a2f38;--acc:#4c8dff;--acc-fg:#0b0d10;--warn:#ff8a7a;--ok:#5fd39a}}
+:root[data-theme="dark"]{--bg:#0f1115;--card:#181b21;--fg:#e8eaee;--muted:#9aa3b0;--line:#2a2f38;--acc:#4c8dff;--acc-fg:#0b0d10;--warn:#ff8a7a;--ok:#5fd39a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,sans-serif;padding:16px;padding-bottom:max(16px,env(safe-area-inset-bottom))}
+main{max-width:560px;margin:0 auto;display:grid;gap:12px}
+h1{font-size:20px;margin:4px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;display:grid;gap:10px}
+label{font-size:13px;color:var(--muted)}
+select,textarea,input{width:100%;font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;min-height:44px}
+textarea{min-height:120px;resize:vertical}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.chip{flex:1;min-height:44px;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:22px;font:inherit}
+.chip[aria-pressed="true"]{background:var(--acc);color:var(--acc-fg);border-color:var(--acc)}
+button.send{min-height:48px;border:0;border-radius:10px;background:var(--acc);color:var(--acc-fg);font:600 17px system-ui}
+button:focus-visible,select:focus-visible,textarea:focus-visible,input:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+#log{display:grid;gap:8px}
+.msg{border-left:3px solid var(--line);padding:4px 10px}
+.msg.ask{border-color:var(--acc)} .msg.warn{border-color:var(--warn)} .msg.ok{border-color:var(--ok)}
+.msg b{display:block;font-size:13px;color:var(--muted)}
+.msg p{margin:2px 0;white-space:pre-wrap;word-break:break-word}
+.msg button{min-height:44px;margin-top:4px;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:8px;padding:0 12px;font:inherit}
+#status{font-size:13px;color:var(--muted)}
+details summary{min-height:44px;display:flex;align-items:center;cursor:pointer;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Kön</h1>
+  <div class="card">
+    <div><label for="target">Till</label>
+      <select id="target"></select></div>
+    <div class="row" role="group" aria-label="Typ">
+      <button class="chip" data-type="idea" aria-pressed="true">Idé</button>
+      <button class="chip" data-type="bug" aria-pressed="false">Bugg</button>
+      <button class="chip" data-type="feature" aria-pressed="false">Feature</button>
+    </div>
+    <div><label for="text" id="textlabel">Text</label>
+      <textarea id="text" placeholder="Vad vill du?"></textarea></div>
+    <button class="send" id="send">Skicka</button>
+    <div id="status" role="status" aria-live="polite"></div>
+  </div>
+  <div class="card"><div id="log" aria-live="polite"></div></div>
+  <details class="card"><summary>Inställningar</summary>
+    <div><label for="url">Server</label><input id="url" inputmode="url" value="" placeholder="https://ntfy.example.com"></div>
+    <div><label for="token">Token (bara på den här telefonen)</label><input id="token" type="password" autocomplete="off"></div>
+    <div class="row">
+      <div style="flex:1"><label for="qin">Ut till kön</label><input id="qin" value="q-in"></div>
+      <div style="flex:1"><label for="qout">Svar</label><input id="qout" value="q-out"></div>
+    </div>
+    <button class="send" id="save">Spara</button>
+  </details>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d) { try { return localStorage.getItem("q." + k) ?? d } catch { return d } },
+  set(k, v) { try { localStorage.setItem("q." + k, v) } catch {} },
+};
+for (const k of ["url", "token", "qin", "qout"]) $(k).value = store.get(k, $(k).value);
+let type = "idea", answering = null, ws = null;
+
+document.querySelectorAll(".chip").forEach(b => b.onclick = () => {
+  type = b.dataset.type;
+  document.querySelectorAll(".chip").forEach(c => c.setAttribute("aria-pressed", c === b));
+});
+
+const cfg = () => ({ url: $("url").value.replace(/\/+$/, ""), token: $("token").value.trim(),
+                     qin: $("qin").value.trim(), qout: $("qout").value.trim() });
+const auth = t => ({ Authorization: "Bearer " + t });
+const authParam = t => btoa("Bearer " + t).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+
+function setTargets(state) {
+  const sel = $("target"), keep = store.get("target", "");
+  sel.textContent = "";
+  for (const [proj, v] of Object.entries(state).sort()) {
+    const g = document.createElement("optgroup"); g.label = proj;
+    const all = new Option(v.orch ? `${proj}: orkestreraren` : `${proj}: alla`, proj);
+    g.append(all);
+    for (const s of v.sessions) if (s !== v.orch) g.append(new Option(`${proj} / ${s}`, `${proj}/${s}`));
+    sel.append(g);
+  }
+  if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+}
+$("target").onchange = () => store.set("target", $("target").value);
+
+function show(m) {
+  if ((m.tags || []).includes("sessions")) {
+    try { setTargets(JSON.parse(m.message)) } catch {}
+    return;
+  }
+  const d = document.createElement("div");
+  const tags = m.tags || [];
+  d.className = "msg" + (tags.includes("question") ? " ask" : tags.includes("warning") ? " warn" :
+                         tags.includes("white_check_mark") ? " ok" : "");
+  const b = document.createElement("b");
+  b.textContent = `${m.title || "kön"} · ${new Date(m.time * 1000).toLocaleTimeString("sv", {hour: "2-digit", minute: "2-digit"})}`;
+  const p = document.createElement("p"); p.textContent = m.message;
+  d.append(b, p);
+  const id = (m.title || "").match(/\((\d{6}-\d{4}-[a-z2-7]{3})\)/);
+  if (id) {
+    const btn = document.createElement("button"); btn.textContent = "Svara";
+    btn.onclick = () => { answering = id[1]; $("textlabel").textContent = `Svar på ${id[1]}`;
+                          $("send").textContent = "Skicka svar"; $("text").focus(); };
+    d.append(btn);
+  }
+  $("log").prepend(d);
+  while ($("log").children.length > 40) $("log").lastChild.remove();
+}
+
+async function load() {
+  const c = cfg();
+  if (!c.token) { $("status").textContent = "Lägg in din token under Inställningar."; return; }
+  try {
+    const r = await fetch(`${c.url}/${c.qout}/json?poll=1&since=12h`, { headers: auth(c.token) });
+    if (!r.ok) throw new Error(r.status);
+    $("log").textContent = "";
+    for (const line of (await r.text()).split("\n")) if (line) { const m = JSON.parse(line); if (m.event === "message") show(m); }
+    $("status").textContent = "";
+  } catch (e) { $("status").textContent = `Kunde inte läsa svaren (${e.message}).`; }
+  if (ws) ws.close();
+  ws = new WebSocket(`${c.url.replace(/^http/, "ws")}/${c.qout}/ws?auth=${authParam(c.token)}`);
+  ws.onmessage = e => { const m = JSON.parse(e.data); if (m.event === "message") show(m); };
+  ws.onclose = () => setTimeout(() => document.visibilityState === "visible" && load(), 5000);
+}
+
+$("send").onclick = async () => {
+  const c = cfg(), text = $("text").value.trim();
+  if (!text) return;
+  const body = answering ? `${answering}: ${text}` :
+               `${type === "idea" ? "" : type + " "}${$("target").value || "?"}: ${text}`;
+  $("send").disabled = true;
+  try {
+    const r = await fetch(`${c.url}/${c.qin}`, { method: "POST", headers: auth(c.token), body });
+    if (!r.ok) throw new Error(r.status);
+    $("text").value = ""; answering = null;
+    $("textlabel").textContent = "Text"; $("send").textContent = "Skicka";
+    $("status").textContent = "Skickat.";
+  } catch (e) { $("status").textContent = `Inte skickat (${e.message}). Texten ligger kvar.`; }
+  $("send").disabled = false;
+};
+$("text").oninput = () => store.set("draft", $("text").value);
+$("text").value = store.get("draft", "");
+
+$("save").onclick = () => { for (const k of ["url", "token", "qin", "qout"]) store.set(k, $(k).value.trim()); load(); };
+document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && (!ws || ws.readyState > 1) && load());
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+load();
+</script>
+</body>
+</html>
